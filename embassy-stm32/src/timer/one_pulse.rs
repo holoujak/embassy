@@ -7,12 +7,14 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use super::low_level::{
-    CountingMode, FilterValue, InputCaptureMode, InputCaptureSelection, SlaveMode, Timer, TriggerSource as Ts,
+    CountingMode, FilterValue, InputCaptureMode, InputCaptureSelection, OutputCompareMode, OutputPolarity, SlaveMode,
+    Timer, TriggerSource as Ts,
 };
+use super::simple_pwm::PwmPin;
 use super::{CaptureCompareInterruptHandler, Channel, ExternalTriggerPin, GeneralInstance4Channel, TimerPin};
 pub use super::{Ch1, Ch2};
 use crate::Peri;
-use crate::gpio::{AfType, Flex, Pull};
+use crate::gpio::{AfType, Flex, OutputType, Pull};
 use crate::interrupt::typelevel::{Binding, Interrupt};
 use crate::pac::timer::vals::Etp;
 use crate::rcc::WakeGuard;
@@ -85,10 +87,13 @@ impl<'d, T: GeneralInstance4Channel> TriggerPin<'d, T, Ext> {
 
 /// One pulse driver.
 ///
-/// Generates a pulse after a trigger and some configurable delay.
+/// Configures a timer to generate a pulse after a trigger and configurable delay.
+/// An output channel must be configured with [`Self::configure_pulse_output`].
 pub struct OnePulse<'d, T: GeneralInstance4Channel> {
     inner: Timer<'d, T>,
     _pin: Flex<'d>,
+    output_pins: [Option<Flex<'d>>; 4],
+    trigger_channel: Option<Channel>,
     _wake_guard: WakeGuard,
 }
 
@@ -109,6 +114,8 @@ impl<'d, T: GeneralInstance4Channel> OnePulse<'d, T> {
         let mut this = Self {
             inner: Timer::new(tim),
             _pin: pin.pin,
+            output_pins: [None, None, None, None],
+            trigger_channel: Some(Channel::Ch1),
             _wake_guard: T::RCC_INFO.wake_guard(),
         };
 
@@ -137,6 +144,8 @@ impl<'d, T: GeneralInstance4Channel> OnePulse<'d, T> {
         let mut this = Self {
             inner: Timer::new(tim),
             _pin: _pin.pin,
+            output_pins: [None, None, None, None],
+            trigger_channel: Some(Channel::Ch1),
             _wake_guard: T::RCC_INFO.wake_guard(),
         };
 
@@ -166,6 +175,8 @@ impl<'d, T: GeneralInstance4Channel> OnePulse<'d, T> {
         let mut this = Self {
             inner: Timer::new(tim),
             _pin: _pin.pin,
+            output_pins: [None, None, None, None],
+            trigger_channel: Some(Channel::Ch2),
             _wake_guard: T::RCC_INFO.wake_guard(),
         };
 
@@ -194,6 +205,8 @@ impl<'d, T: GeneralInstance4Channel> OnePulse<'d, T> {
         let mut this = Self {
             inner: Timer::new(tim),
             _pin: _pin.pin,
+            output_pins: [None, None, None, None],
+            trigger_channel: None,
             _wake_guard: T::RCC_INFO.wake_guard(),
         };
 
@@ -235,6 +248,36 @@ impl<'d, T: GeneralInstance4Channel> OnePulse<'d, T> {
         self.inner.set_max_compare_value(unwrap!(ticks.try_into()))
     }
 
+    /// Configure a channel as a pulse output.
+    ///
+    /// The output channel is determined by the pin type. When the trigger uses
+    /// a timer channel, use a different channel for the output. Pulse timing is
+    /// intended for [`CountingMode::EdgeAlignedUp`]. The channel remains disabled
+    /// until [`OnePulseChannel::enable_output`] is called.
+    pub fn configure_pulse_output<C: TimerChannel, #[cfg(afio)] A>(
+        &mut self,
+        pin: Peri<'d, if_afio!(impl TimerPin<T, C, A>)>,
+    ) {
+        let channel = C::CHANNEL;
+        if let Some(trigger_channel) = self.trigger_channel {
+            assert_ne!(
+                channel.index(),
+                trigger_channel.index(),
+                "trigger channel cannot be used as output"
+            );
+        }
+        assert!(
+            self.output_pins[channel.index()].is_none(),
+            "pulse output is already configured"
+        );
+
+        self.inner.enable_channel(channel, false);
+        let pin = PwmPin::new(pin, OutputType::PushPull);
+        self.inner.set_output_compare_mode(channel, OutputCompareMode::PwmMode2);
+        self.inner.set_output_polarity(channel, OutputPolarity::ActiveHigh);
+        self.output_pins[channel.index()] = Some(pin.pin);
+    }
+
     /// Reset the timer on each trigger
     #[cfg(not(stm32l0))]
     pub fn set_reset_on_trigger(&mut self, reset: bool) {
@@ -253,6 +296,7 @@ impl<'d, T: GeneralInstance4Channel> OnePulse<'d, T> {
         OnePulseChannel {
             inner: unsafe { self.inner.clone_unchecked() },
             channel,
+            pin: None,
         }
     }
 
@@ -300,11 +344,15 @@ impl<'d, T: GeneralInstance4Channel> OnePulse<'d, T> {
         'd: 'static,
     {
         // without this, the timer would be disabled at the end of this function
-        let timer = ManuallyDrop::new(self.inner);
+        let Self {
+            inner, mut output_pins, ..
+        } = self;
+        let timer = ManuallyDrop::new(inner);
 
-        let ch = |channel| OnePulseChannel {
+        let mut ch = |channel| OnePulseChannel {
             inner: unsafe { timer.clone_unchecked() },
             channel,
+            pin: output_pins[channel.index()].take(),
         };
 
         OnePulseChannels {
@@ -336,6 +384,7 @@ pub struct OnePulseChannels<'d, T: GeneralInstance4Channel> {
 pub struct OnePulseChannel<'d, T: GeneralInstance4Channel> {
     inner: ManuallyDrop<Timer<'d, T>>,
     channel: Channel,
+    pin: Option<Flex<'d>>,
 }
 
 impl<'d, T: GeneralInstance4Channel> OnePulseChannel<'d, T> {
@@ -368,6 +417,11 @@ impl<'d, T: GeneralInstance4Channel> OnePulseChannel<'d, T> {
         self.set_pulse_delay(self.pulse_end() - width);
     }
 
+    /// Enable the output compare channel.
+    pub fn enable_output(&self) {
+        self.inner.enable_channel(self.channel, true);
+    }
+
     /// Waits until the trigger and following delay has passed.
     pub async fn wait_for_pulse_start(&mut self) {
         self.inner.enable_input_interrupt(self.channel, true);
@@ -377,6 +431,14 @@ impl<'d, T: GeneralInstance4Channel> OnePulseChannel<'d, T> {
             phantom: PhantomData,
         }
         .await
+    }
+}
+
+impl<T: GeneralInstance4Channel> Drop for OnePulseChannel<'_, T> {
+    fn drop(&mut self) {
+        if self.pin.is_some() {
+            self.inner.enable_channel(self.channel, false);
+        }
     }
 }
 
